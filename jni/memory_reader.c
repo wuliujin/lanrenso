@@ -478,3 +478,117 @@ int write_int_to_address(uintptr_t addr, int value) {
 }
 
 
+
+// ---------- 高性能：搜索单个 int 值 ----------
+__attribute__((visibility("default")))
+char* search_int_filter(int value1, int search_from_previous) {
+    if (g_mem_fd < 0) return NULL;
+
+    uintptr_t* results = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+
+    // 动态数组增长函数
+    #define ENSURE_CAP() \
+        do { \
+            if (count >= capacity) { \
+                size_t new_cap = (capacity == 0) ? 1024 : capacity * 2; \
+                uintptr_t* tmp = (uintptr_t*)realloc(results, new_cap * sizeof(uintptr_t)); \
+                if (!tmp) break; \
+                results = tmp; \
+                capacity = new_cap; \
+            } \
+        } while (0)
+
+
+    // -------------------------
+    // 1) 从上次搜索结果过滤
+    // -------------------------
+    if (search_from_previous && g_prev_results && g_prev_count > 0) {
+
+        for (size_t i = 0; i < g_prev_count; i++) {
+            uintptr_t addr = g_prev_results[i];
+            int val = 0;
+
+            if (pread64(g_mem_fd, &val, sizeof(val), (off64_t)addr) == (ssize_t)sizeof(val)) {
+                if (val == value1) {
+                    ENSURE_CAP();
+                    results[count++] = addr;
+                }
+            }
+        }
+    }
+
+    // -------------------------
+    // 2) 全局扫描（分块 4096 字节）
+    // -------------------------
+    else {
+        char maps_path[64];
+        snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", g_pid);
+        FILE *maps = fopen(maps_path, "r");
+        if (!maps) return NULL;
+
+        char line[512];
+        const size_t CHUNK = 4096;   // 一次读 4KB
+        unsigned char* buf = (unsigned char*)malloc(CHUNK);
+        if (!buf) { fclose(maps); return NULL; }
+
+        while (fgets(line, sizeof(line), maps)) {
+            uintptr_t start = 0, end = 0;
+            char perms[8] = {0};
+
+            if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s", &start, &end, perms) < 2)
+                continue;
+            if (!strchr(perms, 'r'))
+                continue;
+
+            for (uintptr_t addr = start; addr + sizeof(int) <= end; addr += CHUNK) {
+                size_t size = CHUNK;
+                if (addr + size > end) size = end - addr;
+
+                ssize_t n = pread64(g_mem_fd, buf, size, (off64_t)addr);
+                if (n <= 0) continue;
+
+                // 按 4 字节步进扫描
+                for (size_t i = 0; i + sizeof(int) <= (size_t)n; i += sizeof(int)) {
+                    int v;
+                    memcpy(&v, buf + i, sizeof(int));
+                    if (v == value1) {
+                        ENSURE_CAP();
+                        results[count++] = addr + i;
+                    }
+                }
+            }
+        }
+
+        free(buf);
+        fclose(maps);
+    }
+
+    // -------------------------
+    // 更新全局缓存
+    // -------------------------
+    if (g_prev_results) free(g_prev_results);
+    g_prev_results = results;
+    g_prev_count = count;
+
+    if (count == 0) return NULL;
+
+    // -------------------------
+    // 拼接成字符串 "addr1|addr2|..."
+    // -------------------------
+    size_t buf_len = count * 32 + 1;
+    char* str = (char*)malloc(buf_len);
+    if (!str) return NULL;
+
+    char *p = str;
+    for (size_t i = 0; i < count; i++) {
+        p += snprintf(p, buf_len - (p - str), "%" PRIxPTR "|", results[i]);
+    }
+    if (p > str) *(p - 1) = '\0';
+
+    return str;
+}
+
+
+
